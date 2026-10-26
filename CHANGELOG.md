@@ -35,6 +35,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `BitWriter` collects bits in a 64-bit accumulator and flushes four
+  bytes at a time; Rice and exp-Golomb codewords are written with one
+  `write_bits` call instead of one call per prefix bit. New
+  `BitWriter::with_capacity` and `BitWriter::write_zeros`. The output is
+  unchanged.
 - Encoder: source samples are read a block row at a time, with the bit
   depth resolved once per block and edge clamping only on right-edge
   blocks; the output is unchanged.

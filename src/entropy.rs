@@ -123,13 +123,7 @@ pub fn write_combo(bw: &mut BitWriter, n: u32, last_rice_q: u32, k_rice: u32, k_
         // Rice branch: q = n / 2^kRice, r = n mod 2^kRice.
         let q = n >> k_rice;
         let r = n & ((1u32 << k_rice) - 1);
-        for _ in 0..q {
-            bw.write_bit(0);
-        }
-        bw.write_bit(1);
-        if k_rice > 0 {
-            bw.write_bits(r, k_rice);
-        }
+        write_prefixed(bw, q, r, k_rice);
     } else {
         // Exp-Golomb branch: emit (last_rice_q + 1) zeros prefix, then
         // an order-k_exp exp-Golomb codeword for `n - switch_value`.
@@ -138,16 +132,10 @@ pub fn write_combo(bw: &mut BitWriter, n: u32, last_rice_q: u32, k_rice: u32, k_
         let x = (n2 as u64) + (1u64 << k_exp);
         let q_exp = (63 - x.leading_zeros()) - k_exp;
         // Total leading zeros = (last_rice_q + 1) + q_exp; then a 1 bit; then suffix.
-        for _ in 0..(last_rice_q + 1 + q_exp) {
-            bw.write_bit(0);
-        }
-        bw.write_bit(1);
         let suffix_bits = q_exp + k_exp;
-        if suffix_bits > 0 {
-            // suffix = n2 + 2^k_exp - 2^(q_exp + k_exp) (last suffix_bits bits)
-            let suffix_val = (x - (1u64 << (q_exp + k_exp))) as u32;
-            bw.write_bits(suffix_val, suffix_bits);
-        }
+        // suffix = n2 + 2^k_exp - 2^(q_exp + k_exp) (last suffix_bits bits)
+        let suffix_val = (x - (1u64 << suffix_bits)) as u32;
+        write_prefixed(bw, last_rice_q + 1 + q_exp, suffix_val, suffix_bits);
     }
 }
 
@@ -186,14 +174,29 @@ pub fn read_exp_golomb(br: &mut BitReader<'_>, k: u32) -> Result<u32> {
 pub fn write_exp_golomb(bw: &mut BitWriter, n: u32, k: u32) {
     let x = (n as u64) + (1u64 << k);
     let q = (63 - x.leading_zeros()) - k;
-    for _ in 0..q {
-        bw.write_bit(0);
-    }
-    bw.write_bit(1);
     let bits = q + k;
-    if bits > 0 {
-        let suffix = (x - (1u64 << (q + k))) as u32;
-        bw.write_bits(suffix, bits);
+    let suffix = (x - (1u64 << bits)) as u32;
+    write_prefixed(bw, q, suffix, bits);
+}
+
+/// Write `zeros` zero bits, a one bit, then the low `suffix_bits` bits
+/// of `suffix`: the shape shared by every Rice and exp-Golomb codeword.
+/// A codeword of up to 32 bits (all but pathological symbols) goes out
+/// in a single `write_bits`, since the zero prefix is just the leading
+/// zeros of `1 << suffix_bits | suffix` in a `zeros + 1 + suffix_bits`
+/// bit field.
+#[inline]
+fn write_prefixed(bw: &mut BitWriter, zeros: u32, suffix: u32, suffix_bits: u32) {
+    let len = zeros + 1 + suffix_bits;
+    if len <= 32 {
+        let mask = ((1u64 << suffix_bits) - 1) as u32;
+        bw.write_bits(((1u64 << suffix_bits) as u32) | (suffix & mask), len);
+    } else {
+        bw.write_zeros(zeros);
+        bw.write_bit(1);
+        if suffix_bits > 0 {
+            bw.write_bits(suffix, suffix_bits);
+        }
     }
 }
 
