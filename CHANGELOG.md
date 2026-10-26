@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `EncoderConfig::threads` (`with_threads`, `with_all_threads`): code
+  the slices of each picture on several scoped threads. The output is
+  byte-identical for every thread count (`tests/encoder_threads.rs`);
+  the default codes on the calling thread as before.
 - Opt-in decoder entry points that keep reconstructed samples beyond
   the visible width: `decoder::decode_packet_with_chroma_border` (one
   more 4:2:2 chroma column when an even visible width ends inside a

@@ -218,6 +218,17 @@ pub struct EncoderConfig {
     /// §7.5.2-mirror promotion — and an explicit request that
     /// contradicts the format is refused at construction.
     pub alpha_channel_type: Option<AlphaChannelType>,
+    /// Worker threads that code the slices of each picture. Slices are
+    /// independent (RDD 36 §5.3), so a picture splits into runs of
+    /// slices coded in parallel and joined in order; the output is
+    /// byte-identical for every thread count.
+    ///
+    /// `0` (the default) and `1` code on the calling thread, as before.
+    /// `n > 1` uses up to `n` scoped threads per picture. Use
+    /// [`Self::with_threads`] to set it, or [`Self::with_all_threads`]
+    /// for one per available CPU. A caller that already encodes several
+    /// frames in parallel should leave this at the default.
+    pub threads: usize,
 }
 
 /// Maximum number of trial encodes per frame when rate control is active.
@@ -402,6 +413,19 @@ impl EncoderConfig {
     pub fn with_alpha_channel_type(mut self, act: AlphaChannelType) -> Self {
         self.alpha_channel_type = Some(act);
         self
+    }
+
+    /// Code each picture's slices on up to `threads` threads; see
+    /// [`Self::threads`].
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.threads = threads;
+        self
+    }
+
+    /// Code each picture's slices on one thread per available CPU
+    /// (`std::thread::available_parallelism`); see [`Self::threads`].
+    pub fn with_all_threads(self) -> Self {
+        self.with_threads(std::thread::available_parallelism().map_or(1, |n| n.get()))
     }
 }
 
@@ -888,6 +912,7 @@ impl Encoder for ProResEncoder {
                         None => None,
                     }
                 };
+                let threads = self.config.threads.max(1);
                 let data = if self.target_bytes > 0 {
                     encode_frame_with_rate_control(
                         v,
@@ -904,6 +929,7 @@ impl Encoder for ProResEncoder {
                         self.interlace_mode,
                         self.log2_slice_mb_width,
                         alpha,
+                        threads,
                     )?
                 } else {
                     encode_frame_full(
@@ -920,6 +946,7 @@ impl Encoder for ProResEncoder {
                         self.config.explicit_qmat_carriage,
                         self.meta,
                         self.log2_slice_mb_width,
+                        threads,
                     )?
                 };
                 // RDD 36 §5.1.2 / §6.1.2: pad up to the configured
@@ -1055,6 +1082,7 @@ pub fn encode_frame_with_qmats(
         false,
         FrameMeta::default(),
         3, // log2(8) — default slice width matches every reference encoder
+        1,
     )
 }
 
@@ -1099,6 +1127,7 @@ pub fn encode_frame_with_alpha(
         false,
         FrameMeta::default(),
         3, // log2(8) — default slice width matches every reference encoder
+        1,
     )
 }
 
@@ -1139,6 +1168,7 @@ pub fn encode_frame_interlaced(
         false,
         FrameMeta::default(),
         3, // log2(8) — default slice width matches every reference encoder
+        1,
     )
 }
 
@@ -1217,6 +1247,7 @@ fn encode_frame_with_rate_control(
     interlace_mode: u8,
     log2_slice_mb_width: u8,
     alpha: Option<AlphaCoding>,
+    threads: usize,
 ) -> Result<Vec<u8>> {
     let tol_lo = (target_bytes as f64 * (1.0 - RATE_CTRL_TOLERANCE)) as usize;
     let tol_hi = (target_bytes as f64 * (1.0 + RATE_CTRL_TOLERANCE)) as usize;
@@ -1239,6 +1270,7 @@ fn encode_frame_with_rate_control(
         explicit_qmat_carriage,
         meta,
         log2_slice_mb_width,
+        threads,
     )?;
     if seed.len() >= tol_lo && seed.len() <= tol_hi {
         return Ok(seed);
@@ -1287,6 +1319,7 @@ fn encode_frame_with_rate_control(
             explicit_qmat_carriage,
             meta,
             log2_slice_mb_width,
+            threads,
         )?;
         let sz = candidate.len();
         if sz >= tol_lo && sz <= tol_hi {
@@ -1342,6 +1375,7 @@ fn encode_frame_full(
     explicit_qmat_carriage: bool,
     meta: FrameMeta,
     log2_slice_mb_width: u8,
+    threads: usize,
 ) -> Result<Vec<u8>> {
     // Defence-in-depth: the spec stores log2_desired_slice_size_in_mb
     // in two bits so only 0..=3 is representable. Callers go through
@@ -1467,6 +1501,7 @@ fn encode_frame_full(
             log2_slice_mb_width,
             interlaced,
             *field,
+            threads,
         )?;
         picture_blobs.push(blob);
     }
@@ -1534,6 +1569,9 @@ struct SliceScratch {
     alpha: Vec<u16>,
     header: Vec<u8>,
 }
+
+/// Coded slices: their concatenated bytes and each slice's size.
+type CodedRun = (Vec<u8>, Vec<u16>);
 
 /// The per-picture state shared by every slice of one `picture()`.
 struct PictureCoder<'a> {
@@ -1680,6 +1718,80 @@ impl PictureCoder<'_> {
         out[start..start + header_size].copy_from_slice(&scratch.header);
         Ok(())
     }
+
+    /// Code `slices` in order into one payload buffer, returning it with
+    /// each slice's size. With `threads > 1` the list is cut into runs
+    /// of consecutive slices that worker threads claim one at a time,
+    /// each coding into its own buffer with its own scratch; the runs
+    /// are then joined in order, so the payload does not depend on the
+    /// thread count or on scheduling.
+    fn encode_slices(&self, slices: &[(usize, usize, usize)], threads: usize) -> Result<CodedRun> {
+        let run = |slices: &[(usize, usize, usize)], scratch: &mut SliceScratch| {
+            let mut payload = Vec::new();
+            let mut sizes = Vec::with_capacity(slices.len());
+            for &(mx, my, mbs) in slices {
+                let start = payload.len();
+                self.encode_slice(mx, my, mbs, scratch, &mut payload)?;
+                let size = u16::try_from(payload.len() - start).map_err(|_| {
+                    Error::invalid("prores encoder: slice exceeded u16 size table limit")
+                })?;
+                sizes.push(size);
+            }
+            Ok::<_, Error>((payload, sizes))
+        };
+        // Several runs per thread even out slices of uneven cost, and a
+        // run of at least a few slices keeps the per-run overhead small.
+        const RUNS_PER_THREAD: usize = 4;
+        const MIN_RUN: usize = 8;
+        let run_len = slices
+            .len()
+            .div_ceil(threads * RUNS_PER_THREAD)
+            .max(MIN_RUN);
+        let runs: Vec<_> = slices.chunks(run_len).collect();
+        let threads = threads.min(runs.len());
+        if threads <= 1 {
+            return run(slices, &mut SliceScratch::default());
+        }
+
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let mut coded: Vec<Option<Result<CodedRun>>> = Vec::new();
+        coded.resize_with(runs.len(), || None);
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..threads)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut scratch = SliceScratch::default();
+                        let mut done = Vec::new();
+                        loop {
+                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let Some(slices) = runs.get(i) else {
+                                break;
+                            };
+                            done.push((i, run(slices, &mut scratch)));
+                        }
+                        done
+                    })
+                })
+                .collect();
+            for worker in workers {
+                let done = worker
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                for (i, result) in done {
+                    coded[i] = Some(result);
+                }
+            }
+        });
+
+        let mut payload = Vec::new();
+        let mut sizes = Vec::with_capacity(slices.len());
+        for result in coded {
+            let (bytes, run_sizes) = result.expect("every run is claimed by a worker")?;
+            payload.extend_from_slice(&bytes);
+            sizes.extend_from_slice(&run_sizes);
+        }
+        Ok((payload, sizes))
+    }
 }
 
 /// Build one `picture()` blob (picture_header + slice_table +
@@ -1692,8 +1804,9 @@ impl PictureCoder<'_> {
 /// decoder dequantises with the matching W[][].
 ///
 /// Slices are coded straight into one payload buffer with one set of
-/// [`SliceScratch`] buffers, then the header and slice table are
-/// prepended.
+/// [`SliceScratch`] buffers per thread (see
+/// [`PictureCoder::encode_slices`]), then the header and slice table
+/// are prepended.
 #[allow(clippy::too_many_arguments)]
 fn encode_one_picture(
     frame: &VideoFrame,
@@ -1709,6 +1822,7 @@ fn encode_one_picture(
     log2_slice_mb_width: u8,
     interlaced: bool,
     field: FieldStride,
+    threads: usize,
 ) -> Result<Vec<u8>> {
     let coder = PictureCoder {
         frame,
@@ -1732,9 +1846,8 @@ fn encode_one_picture(
     let slice_sizes_template = compute_slice_sizes(mbs_x, log2_slice_mb_width);
     let slice_count = slice_sizes_template.len() * mbs_y;
 
-    let mut scratch = SliceScratch::default();
-    let mut payload: Vec<u8> = Vec::new();
-    let mut slice_sizes: Vec<u16> = Vec::with_capacity(slice_count);
+    // (mx, my, mbs) of every slice, in coding order.
+    let mut slices: Vec<(usize, usize, usize)> = Vec::with_capacity(slice_count);
     for my in 0..mbs_y {
         let mut mx = 0usize;
         for &mbs_this_slice in &slice_sizes_template {
@@ -1742,16 +1855,12 @@ fn encode_one_picture(
             if mbs_this_slice == 0 {
                 break;
             }
-            let start = payload.len();
-            coder.encode_slice(mx, my, mbs_this_slice, &mut scratch, &mut payload)?;
-            let size = u16::try_from(payload.len() - start).map_err(|_| {
-                Error::invalid("prores encoder: slice exceeded u16 size table limit")
-            })?;
-            slice_sizes.push(size);
+            slices.push((mx, my, mbs_this_slice));
             mx += mbs_this_slice;
         }
     }
-    debug_assert_eq!(slice_sizes.len(), slice_count);
+    debug_assert_eq!(slices.len(), slice_count);
+    let (payload, slice_sizes) = coder.encode_slices(&slices, threads)?;
 
     let slice_table_size = slice_count * 2;
     let picture_header_size = 8usize;
