@@ -35,6 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Encoder: source samples are read a block row at a time, with the bit
+  depth resolved once per block and edge clamping only on right-edge
+  blocks; the output is unchanged.
 - Decoder: a block whose inverse transform is constant (DC-only, as in
   flat areas) converts its sample once and stores it 64 times; the
   output is unchanged (#14).

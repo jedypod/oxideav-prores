@@ -448,7 +448,7 @@ impl AlphaCoding {
 /// Read one alpha sample from the 4th input plane at its declared
 /// input depth. 8-bit planes hold 1 byte per sample; deep planes hold
 /// little-endian 16-bit words with the low `b` bits significant,
-/// masked to the depth exactly like [`read_sample`] masks the colour
+/// masked to the depth exactly like [`read_block`] masks the colour
 /// planes. `stride` is in **bytes**.
 fn read_alpha_input(plane: &[u8], stride: usize, x: usize, y: usize, depth: BitDepth) -> u16 {
     match depth {
@@ -1719,36 +1719,72 @@ fn encode_one_picture(
     Ok(blob)
 }
 
-/// Sample one IDCT input value from the source plane at sample
-/// coordinate `(x, y)`, applying the spec's level-shift to a centred
-/// `v` in the range `[-256, 256)` per RDD 36 §7.5.1. The inverse of
-/// the decoder formula `s = 2^b * (v + 256) / 512` is
-/// `v = s * 512 / 2^b - 256 = s / 2^(b-9) - 256`. `stride` is in
-/// **bytes**; for 10/12-bit planes that's `2 * samples_per_row`.
-fn read_sample(plane: &[u8], stride: usize, x: usize, y: usize, bit_depth: BitDepth) -> f32 {
-    match bit_depth {
-        BitDepth::Eight => (plane[y * stride + x] as f32) * 2.0 - 256.0,
-        BitDepth::Ten => {
-            let off = y * stride + x * 2;
-            let lo = plane[off] as u16;
-            let hi = plane[off + 1] as u16;
-            let s = (lo | (hi << 8)) & 0x03FF;
-            (s as f32) / 2.0 - 256.0
-        }
-        BitDepth::Twelve => {
-            let off = y * stride + x * 2;
-            let lo = plane[off] as u16;
-            let hi = plane[off + 1] as u16;
-            let s = (lo | (hi << 8)) & 0x0FFF;
-            (s as f32) / 8.0 - 256.0
-        }
+/// Read one 8x8 block of IDCT input values from a source plane,
+/// applying the spec's level-shift to a centred `v` in the range
+/// `[-256, 256)` per RDD 36 §7.5.1. The inverse of the decoder formula
+/// `s = 2^b * (v + 256) / 512` is `v = s * 512 / 2^b - 256 =
+/// s * 2^(9-b) - 256`. `stride` is in **bytes**; for 10/12/16-bit
+/// planes that's `2 * samples_per_row`, each sample a little-endian
+/// word with the low `b` bits significant.
+///
+/// Samples past the right or bottom edge replicate the last column or
+/// row (the boundary-clamp padding of §7.5.1). The bit depth is
+/// resolved once per block rather than once per sample, each source
+/// row is sliced once, and a block that lies wholly inside the plane
+/// (every block but the right-edge ones) reads its eight samples per
+/// row without any per-sample clamp. `2^(9-b)` is a power of two, so
+/// the multiply is exact and matches the former per-sample division.
+#[allow(clippy::too_many_arguments)]
+fn read_block(
+    plane: &[u8],
+    stride: usize,
+    plane_w: usize,
+    plane_h: usize,
+    x0: usize,
+    y0: usize,
+    bit_depth: BitDepth,
+    field: FieldStride,
+    blk: &mut [f32; 64],
+) {
+    let (mask, scale): (u16, f32) = match bit_depth {
+        BitDepth::Eight => (0x00FF, 2.0),
+        BitDepth::Ten => (0x03FF, 0.5),
+        BitDepth::Twelve => (0x0FFF, 0.125),
         // b = 16: every bit of the LE word is significant, no mask.
-        BitDepth::Sixteen => {
-            let off = y * stride + x * 2;
-            let lo = plane[off] as u16;
-            let hi = plane[off + 1] as u16;
-            let s = lo | (hi << 8);
-            (s as f32) / 128.0 - 256.0
+        BitDepth::Sixteen => (0xFFFF, 1.0 / 128.0),
+    };
+    let wide = bit_depth != BitDepth::Eight;
+    let last_x = plane_w.saturating_sub(1);
+    let last_y = plane_h.saturating_sub(1);
+    let interior = x0 + 8 <= plane_w;
+    for (j, out) in blk.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+        // Map per-picture row to per-frame row; this is the identity for
+        // progressive (`step=1, offset=0`) and 2*r+offset for interlaced.
+        let row = &plane[field.map(y0 + j).min(last_y) * stride..];
+        match (wide, interior) {
+            (false, true) => {
+                for (o, &b) in out.iter_mut().zip(&row[x0..x0 + 8]) {
+                    *o = b as f32 * scale - 256.0;
+                }
+            }
+            (true, true) => {
+                let words = row[x0 * 2..x0 * 2 + 16].as_chunks::<2>().0;
+                for (o, w) in out.iter_mut().zip(words) {
+                    *o = (u16::from_le_bytes(*w) & mask) as f32 * scale - 256.0;
+                }
+            }
+            (false, false) => {
+                for (i, o) in out.iter_mut().enumerate() {
+                    *o = row[(x0 + i).min(last_x)] as f32 * scale - 256.0;
+                }
+            }
+            (true, false) => {
+                for (i, o) in out.iter_mut().enumerate() {
+                    let x = (x0 + i).min(last_x) * 2;
+                    let s = u16::from_le_bytes([row[x], row[x + 1]]) & mask;
+                    *o = s as f32 * scale - 256.0;
+                }
+            }
         }
     }
 }
@@ -1767,15 +1803,9 @@ fn encode_block(
     field: FieldStride,
 ) -> [i32; 64] {
     let mut blk = [0.0f32; 64];
-    for j in 0..8 {
-        // Map per-picture row to per-frame row; this is the identity for
-        // progressive (`step=1, offset=0`) and 2*r+offset for interlaced.
-        let frame_row = field.map(y0 + j).min(plane_h.saturating_sub(1));
-        for i in 0..8 {
-            let x = (x0 + i).min(plane_w.saturating_sub(1));
-            blk[j * 8 + i] = read_sample(plane, stride, x, frame_row, bit_depth);
-        }
-    }
+    read_block(
+        plane, stride, plane_w, plane_h, x0, y0, bit_depth, field, &mut blk,
+    );
     // Constant-block fast path: any 8x8 input whose 64 samples are all
     // bit-identical (boundary-clamp pad blocks per RDD 36 §7.5.1, flat
     // regions of natural content at high qi, smooth synthetic gradients)
@@ -2134,7 +2164,7 @@ mod alpha_input_tests {
 
     /// `read_alpha_input` reads 1 byte/sample at `Eight` and masked LE
     /// words at the deep depths, honouring the byte stride — exactly
-    /// like `read_sample` does for the colour planes.
+    /// like `read_block` does for the colour planes.
     #[test]
     fn plane_reads_honour_depth_and_stride() {
         // 3 samples/row × 2 rows, 8-bit.

@@ -125,7 +125,7 @@ pub fn fdct8x8_constant(block: &mut [f32; 64]) {
 /// of `block[..]` equals `block[0]` exactly.
 ///
 /// The encoder calls this on a freshly read-and-level-shifted 8x8 input
-/// block. The samples come from `read_sample()` which returns f32 values
+/// block. The samples come from `read_block()` which returns f32 values
 /// in the centred range `[-256, 256)`; two samples that came from the
 /// same source byte produce bit-identical f32, so a constant-source
 /// block is detected exactly.
@@ -282,7 +282,7 @@ mod tests {
 
     #[test]
     fn fdct_constant_matches_general_fdct() {
-        // Every plausible level-shifted sample value from the read_sample
+        // Every plausible level-shifted sample value from the read_block
         // range `[-256, 256)` plus exact endpoints. The general fdct8x8
         // and the constant fast path must produce identical buffers to
         // f32 round-off.
