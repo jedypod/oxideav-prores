@@ -19,7 +19,7 @@ use oxideav_core::{
 };
 
 use crate::alpha::{AlphaChannelType, encode_scanned_alpha};
-use crate::dct::{fdct8x8, fdct8x8_constant, is_constant_block};
+use crate::dct::{fdct8x8_aan, fdct8x8_aan_scale, is_constant_block};
 use crate::decoder::BitDepth;
 use crate::frame::{
     ChromaFormat, FrameMeta, Profile, compute_slice_sizes, frame_rate_code_from_rational,
@@ -1566,6 +1566,8 @@ fn encode_one_picture(
         ChromaFormat::Y444 => &[(0, 0), (0, 1), (1, 0), (1, 1)],
     };
 
+    let luma_mul = quant_multipliers(luma_qmat, quantization_index);
+    let chroma_mul = quant_multipliers(chroma_qmat, quantization_index);
     let mut slice_payloads: Vec<Vec<u8>> = Vec::with_capacity(slice_count);
     for my in 0..mbs_y {
         let mut mx = 0usize;
@@ -1587,8 +1589,7 @@ fn encode_one_picture(
                         frame_h,
                         x0,
                         y0,
-                        luma_qmat,
-                        quantization_index,
+                        &luma_mul,
                         bit_depth,
                         field,
                     ));
@@ -1608,8 +1609,7 @@ fn encode_one_picture(
                             frame_h,
                             x0,
                             y0,
-                            chroma_qmat,
-                            quantization_index,
+                            &chroma_mul,
                             bit_depth,
                             field,
                         ));
@@ -1797,8 +1797,7 @@ fn encode_block(
     plane_h: usize,
     x0: usize,
     y0: usize,
-    qmat: &[u8; 64],
-    quantization_index: u8,
+    quant_mul: &[f32; 64],
     bit_depth: BitDepth,
     field: FieldStride,
 ) -> [i32; 64] {
@@ -1809,20 +1808,19 @@ fn encode_block(
     // Constant-block fast path: any 8x8 input whose 64 samples are all
     // bit-identical (boundary-clamp pad blocks per RDD 36 §7.5.1, flat
     // regions of natural content at high qi, smooth synthetic gradients)
-    // produces a single DC coefficient of `8 * v` with all 63 AC = 0.
-    // Skip the textbook 64x16 row+column passes of [`fdct8x8`] entirely.
+    // produces a single DC coefficient with all 63 AC = 0. In the
+    // scaled domain of [`fdct8x8_aan`] that DC is the plain sum `64 * v`
+    // (the orthonormal `8 * v` times `fdct8x8_aan_scale(0) = 8`).
     if is_constant_block(&blk) {
-        fdct8x8_constant(&mut blk);
+        let dc = blk[0] * 64.0;
+        blk = [0.0; 64];
+        blk[0] = dc;
     } else {
-        fdct8x8(&mut blk);
+        fdct8x8_aan(&mut blk);
     }
-    // Quantisation: F[v][u] = (QF[v][u] * W[v][u] * qScale) / 8
-    // Inverse: QF = round(F * 8 / (W * qScale)).
-    let qs = qscale(quantization_index) as f32;
     let mut out = [0i32; 64];
     for k in 0..64 {
-        let denom = qmat[k] as f32 * qs;
-        let v = blk[k] * 8.0 / denom;
+        let v = blk[k] * quant_mul[k];
         out[k] = if v >= 0.0 {
             (v + 0.5) as i32
         } else {
@@ -1830,6 +1828,20 @@ fn encode_block(
         };
     }
     out
+}
+
+/// Per-coefficient multipliers that quantise the output of
+/// [`fdct8x8_aan`] (natural order) for weight matrix `qmat` at
+/// `quantization_index`.
+///
+/// Quantisation per RDD 36 §7.3 is `QF = round(F * 8 / (W * qScale))`
+/// on the orthonormal DCT output `F`. The AAN transform leaves `F`
+/// multiplied by [`fdct8x8_aan_scale`], so dividing that back out is
+/// folded in here, and the per-coefficient division becomes a multiply
+/// by a reciprocal computed once per picture in f64.
+fn quant_multipliers(qmat: &[u8; 64], quantization_index: u8) -> [f32; 64] {
+    let qs = qscale(quantization_index) as f64;
+    std::array::from_fn(|k| (8.0 / (fdct8x8_aan_scale(k) * qmat[k] as f64 * qs)) as f32)
 }
 
 #[cfg(test)]
@@ -2007,11 +2019,10 @@ mod tests {
 
     /// Regression for the constant-block fast path in `encode_block`:
     /// a uniform 8x8 input must produce exactly the same quantised
-    /// coefficient vector through the fast path as through the textbook
-    /// `fdct8x8` -> quantise loop. Both paths share the post-DCT
-    /// quantiser, so the test pins the f32 DC produced by
-    /// `fdct8x8_constant` (which is `8 * v`) against the f32 DC the
-    /// general fdct produces on the same input.
+    /// coefficient vector through the fast path as through the general
+    /// `fdct8x8_aan` -> quantise loop. Both paths share the post-DCT
+    /// quantiser, so the test pins the scaled-domain DC of the fast path
+    /// (`64 * v`) against the closed-form quantised DC.
     #[test]
     fn encode_block_constant_input_matches_general_path() {
         // Build a flat 8x8 plane of value 200 (level-shifted v = 144),
@@ -2026,8 +2037,7 @@ mod tests {
             8,
             0,
             0,
-            &qmat,
-            qi,
+            &super::quant_multipliers(&qmat, qi),
             super::BitDepth::Eight,
             super::FieldStride::progressive(),
         );

@@ -35,6 +35,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Encoder forward DCT: the separable Arai-Agui-Nakajima factorisation
+  (`dct::fdct8x8_aan`, 29 adds + 5 multiplies per 8 points) replaces the
+  64-multiply-add matrix form, with its per-frequency output scale
+  (`dct::fdct8x8_aan_scale`) folded into per-picture reciprocal
+  quantiser multipliers. f32 rounding differs at .5 quantisation ties,
+  so three 10/12-bit encoder output pins change; quality is unchanged.
 - Coefficient encoder: the Table 9/10/11 codebooks are precomputed into
   const lookup tables (built from `dc_diff_codebook`, `run_codebook` and
   `level_codebook`, which are now `const fn`), and each run/level/sign
