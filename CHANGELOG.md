@@ -35,6 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Encoder quantiser rounding (half away from zero) is computed without
+  a branch on the sign, so the per-block loop vectorises; the output is
+  unchanged.
 - Encoder forward DCT: the separable Arai-Agui-Nakajima factorisation
   (`dct::fdct8x8_aan`, 29 adds + 5 multiplies per 8 points) replaces the
   64-multiply-add matrix form, with its per-frequency output scale

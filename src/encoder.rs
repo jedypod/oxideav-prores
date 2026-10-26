@@ -1818,16 +1818,14 @@ fn encode_block(
     } else {
         fdct8x8_aan(&mut blk);
     }
-    let mut out = [0i32; 64];
-    for k in 0..64 {
+    // Round half away from zero, written without a branch on the sign
+    // so the loop vectorises; identical results to rounding `|v|` and
+    // restoring the sign.
+    std::array::from_fn(|k| {
         let v = blk[k] * quant_mul[k];
-        out[k] = if v >= 0.0 {
-            (v + 0.5) as i32
-        } else {
-            -((-v + 0.5) as i32)
-        };
-    }
-    out
+        let a = (v.abs() + 0.5) as i32;
+        if v < 0.0 { -a } else { a }
+    })
 }
 
 /// Per-coefficient multipliers that quantise the output of
