@@ -35,6 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Encoder slices are coded straight into one per-picture payload buffer
+  using one reusable set of scratch buffers, instead of allocating block,
+  scan, component and slice vectors for every slice. New appending
+  variants `entropy::encode_scanned_coefficients_into`,
+  `alpha::encode_scanned_alpha_into`,
+  `slice::encode_slice_components_into` and `BitWriter::from_vec`; the
+  existing functions are now thin wrappers over them. The output is
+  unchanged.
 - Encoder quantiser rounding (half away from zero) is computed without
   a branch on the sign, so the per-block loop vectorises; the output is
   unchanged.

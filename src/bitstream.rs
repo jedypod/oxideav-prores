@@ -108,8 +108,15 @@ impl BitWriter {
 
     /// A writer whose output buffer starts with room for `bytes` bytes.
     pub fn with_capacity(bytes: usize) -> Self {
+        Self::from_vec(Vec::with_capacity(bytes))
+    }
+
+    /// A writer that appends to `buf` after its existing bytes, reusing
+    /// its allocation; [`finish`](Self::finish) hands it back.
+    /// `byte_len` and `bit_len` include the existing bytes.
+    pub fn from_vec(buf: Vec<u8>) -> Self {
         Self {
-            buf: Vec::with_capacity(bytes),
+            buf,
             acc: 0,
             acc_bits: 0,
         }

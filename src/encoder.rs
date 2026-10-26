@@ -18,7 +18,7 @@ use oxideav_core::{
     VideoFrame,
 };
 
-use crate::alpha::{AlphaChannelType, encode_scanned_alpha};
+use crate::alpha::{AlphaChannelType, encode_scanned_alpha_into};
 use crate::dct::{fdct8x8_aan, fdct8x8_aan_scale, is_constant_block};
 use crate::decoder::BitDepth;
 use crate::frame::{
@@ -26,7 +26,7 @@ use crate::frame::{
     write_frame_with_meta, write_picture_header, write_slice_header,
 };
 use crate::quant::{QuantMatrices, qscale};
-use crate::slice::{blocks_per_mb, chroma_blocks_per_mb, encode_slice_components};
+use crate::slice::encode_slice_components_into;
 
 /// Encoder-side configuration. Defaults match the legacy behaviour
 /// (flat all-4s quantisation matrices, `load_luma_qmat = 0`,
@@ -1524,6 +1524,164 @@ impl FieldStride {
     }
 }
 
+/// Reusable per-slice working buffers. One set serves every slice a
+/// picture encoder visits, so slices allocate nothing once the buffers
+/// have grown to the largest slice.
+#[derive(Default)]
+struct SliceScratch {
+    blocks: Vec<[i32; 64]>,
+    scan: Vec<i32>,
+    alpha: Vec<u16>,
+    header: Vec<u8>,
+}
+
+/// The per-picture state shared by every slice of one `picture()`.
+struct PictureCoder<'a> {
+    frame: &'a VideoFrame,
+    frame_w: usize,
+    frame_h: usize,
+    /// Chroma plane width in samples.
+    c_w: usize,
+    chroma: ChromaFormat,
+    bit_depth: BitDepth,
+    quantization_index: u8,
+    /// [`quant_multipliers`] for the luma and chroma matrices.
+    luma_mul: [f32; 64],
+    chroma_mul: [f32; 64],
+    alpha: Option<AlphaCoding>,
+    interlaced: bool,
+    field: FieldStride,
+}
+
+impl PictureCoder<'_> {
+    /// Append one complete `slice()` (header, Y, Cb, Cr and optional
+    /// alpha data) for the `mbs` macroblocks starting at macroblock
+    /// `(mx, my)` to `out`.
+    fn encode_slice(
+        &self,
+        mx: usize,
+        my: usize,
+        mbs: usize,
+        scratch: &mut SliceScratch,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        const LUMA_OFFSETS: [(usize, usize); 4] = [(0, 0), (1, 0), (0, 1), (1, 1)];
+        let chroma_offsets: &[(usize, usize)] = match self.chroma {
+            ChromaFormat::Y422 => &[(0, 0), (0, 1)],
+            ChromaFormat::Y444 => &[(0, 0), (0, 1), (1, 0), (1, 1)],
+        };
+        let planes = &self.frame.planes;
+        let blocks = &mut scratch.blocks;
+        blocks.clear();
+        for mb_x in mx..mx + mbs {
+            for (bx, by) in LUMA_OFFSETS {
+                blocks.push(encode_block(
+                    &planes[0].data,
+                    planes[0].stride,
+                    self.frame_w,
+                    self.frame_h,
+                    mb_x * MB_SIDE_PX + bx * 8,
+                    my * MB_SIDE_PX + by * 8,
+                    &self.luma_mul,
+                    self.bit_depth,
+                    self.field,
+                ));
+            }
+            for plane in &planes[1..3] {
+                for &(bx, by) in chroma_offsets {
+                    let x0 = match self.chroma {
+                        ChromaFormat::Y422 => mb_x * 8,
+                        ChromaFormat::Y444 => mb_x * MB_SIDE_PX + bx * 8,
+                    };
+                    blocks.push(encode_block(
+                        &plane.data,
+                        plane.stride,
+                        self.c_w,
+                        self.frame_h,
+                        x0,
+                        my * MB_SIDE_PX + by * 8,
+                        &self.chroma_mul,
+                        self.bit_depth,
+                        self.field,
+                    ));
+                }
+            }
+        }
+
+        // The header carries the payload sizes, so reserve its bytes and
+        // fill them in once the payloads are written.
+        let start = out.len();
+        let header_size = if self.alpha.is_some() { 8 } else { 6 };
+        out.resize(start + header_size, 0);
+        let [y_len, cb_len, cr_len] = encode_slice_components_into(
+            mbs,
+            self.chroma,
+            self.interlaced,
+            blocks,
+            &mut scratch.scan,
+            out,
+        )?;
+        if y_len > u16::MAX as usize || cb_len > u16::MAX as usize || cr_len > u16::MAX as usize {
+            return Err(Error::invalid(
+                "prores encoder: slice component exceeded u16 size limit",
+            ));
+        }
+
+        if let Some(ac) = self.alpha {
+            // Emit alpha for the FULL macroblock-row height (16
+            // sample rows) even when the picture's last MB row is only
+            // partially visible. RDD 36 §5.3 sizes that row's array to
+            // the visible rows (`sliceVerticalSize`), which is what
+            // Apple's encoder writes; ffmpeg's prores_ks writes 16
+            // rows, and both Apple's and ffmpeg's decoders accept
+            // either form (black-box, r480), as does ours (the
+            // decoder's alpha branch). The 16-row form is kept so the
+            // encoder output pins stay stable. Edge pixels for the
+            // partially-visible last MB row clamp to the last visible
+            // row so the stream stays self-roundtrippable.
+            let slice_vertical_size = MB_SIDE_PX;
+            let cols = MB_SIDE_PX * mbs;
+            let samples = &mut scratch.alpha;
+            samples.clear();
+            let a_plane = &planes[3];
+            for r in 0..slice_vertical_size {
+                let frame_row = self
+                    .field
+                    .map(my * MB_SIDE_PX + r)
+                    .min(self.frame_h.saturating_sub(1));
+                for c in 0..cols {
+                    let x = (mx * MB_SIDE_PX + c).min(self.frame_w.saturating_sub(1));
+                    // Read at the input plane's declared depth, then
+                    // map into the coded alpha domain (the
+                    // §7.5.2-mirror conversion; identity when the
+                    // input depth equals the coded width).
+                    let raw = read_alpha_input(
+                        &a_plane.data,
+                        a_plane.stride,
+                        x,
+                        frame_row,
+                        ac.input_depth,
+                    );
+                    samples.push(alpha_input_to_coded(raw, ac.input_depth, ac.act));
+                }
+            }
+            encode_scanned_alpha_into(samples, ac.act, out)?;
+        }
+
+        scratch.header.clear();
+        write_slice_header(
+            &mut scratch.header,
+            self.quantization_index,
+            y_len as u16,
+            cb_len as u16,
+            self.alpha.map(|_| cr_len as u16),
+        );
+        debug_assert_eq!(scratch.header.len(), header_size);
+        out[start..start + header_size].copy_from_slice(&scratch.header);
+        Ok(())
+    }
+}
+
 /// Build one `picture()` blob (picture_header + slice_table +
 /// concatenated slice payloads). For interlaced encodes the caller
 /// invokes this twice (once per field).
@@ -1532,6 +1690,10 @@ impl FieldStride {
 /// `chroma_qmat` is applied to both Cb and Cr blocks. Both matrices
 /// must be the same matrices written into the frame header so the
 /// decoder dequantises with the matching W[][].
+///
+/// Slices are coded straight into one payload buffer with one set of
+/// [`SliceScratch`] buffers, then the header and slice table are
+/// prepended.
 #[allow(clippy::too_many_arguments)]
 fn encode_one_picture(
     frame: &VideoFrame,
@@ -1548,27 +1710,31 @@ fn encode_one_picture(
     interlaced: bool,
     field: FieldStride,
 ) -> Result<Vec<u8>> {
-    let c_w = match chroma {
-        ChromaFormat::Y422 => frame_w.div_ceil(2),
-        ChromaFormat::Y444 => frame_w,
+    let coder = PictureCoder {
+        frame,
+        frame_w,
+        frame_h,
+        c_w: match chroma {
+            ChromaFormat::Y422 => frame_w.div_ceil(2),
+            ChromaFormat::Y444 => frame_w,
+        },
+        chroma,
+        bit_depth,
+        quantization_index,
+        luma_mul: quant_multipliers(luma_qmat, quantization_index),
+        chroma_mul: quant_multipliers(chroma_qmat, quantization_index),
+        alpha,
+        interlaced,
+        field,
     };
     let mbs_x = frame_w.div_ceil(MB_SIDE_PX);
     let mbs_y = picture_height.div_ceil(MB_SIDE_PX);
     let slice_sizes_template = compute_slice_sizes(mbs_x, log2_slice_mb_width);
-    let slices_per_row = slice_sizes_template.len();
-    let slice_count = slices_per_row * mbs_y;
-    let _cb_per_mb = chroma_blocks_per_mb(chroma);
-    let per_mb = blocks_per_mb(chroma);
+    let slice_count = slice_sizes_template.len() * mbs_y;
 
-    const LUMA_OFFSETS: [(usize, usize); 4] = [(0, 0), (1, 0), (0, 1), (1, 1)];
-    let chroma_offsets: &[(usize, usize)] = match chroma {
-        ChromaFormat::Y422 => &[(0, 0), (0, 1)],
-        ChromaFormat::Y444 => &[(0, 0), (0, 1), (1, 0), (1, 1)],
-    };
-
-    let luma_mul = quant_multipliers(luma_qmat, quantization_index);
-    let chroma_mul = quant_multipliers(chroma_qmat, quantization_index);
-    let mut slice_payloads: Vec<Vec<u8>> = Vec::with_capacity(slice_count);
+    let mut scratch = SliceScratch::default();
+    let mut payload: Vec<u8> = Vec::new();
+    let mut slice_sizes: Vec<u16> = Vec::with_capacity(slice_count);
     for my in 0..mbs_y {
         let mut mx = 0usize;
         for &mbs_this_slice in &slice_sizes_template {
@@ -1576,128 +1742,20 @@ fn encode_one_picture(
             if mbs_this_slice == 0 {
                 break;
             }
-            let mut blocks: Vec<[i32; 64]> = Vec::with_capacity(mbs_this_slice * per_mb);
-            for mb_within in 0..mbs_this_slice {
-                let mb_x = mx + mb_within;
-                for (bx, by) in LUMA_OFFSETS {
-                    let x0 = mb_x * MB_SIDE_PX + bx * 8;
-                    let y0 = my * MB_SIDE_PX + by * 8;
-                    blocks.push(encode_block(
-                        &frame.planes[0].data,
-                        frame.planes[0].stride,
-                        frame_w,
-                        frame_h,
-                        x0,
-                        y0,
-                        &luma_mul,
-                        bit_depth,
-                        field,
-                    ));
-                }
-                for plane_idx in [1usize, 2] {
-                    for (bx, by) in chroma_offsets.iter().copied() {
-                        let (x0, y0) = match chroma {
-                            ChromaFormat::Y422 => (mb_x * 8, my * MB_SIDE_PX + by * 8),
-                            ChromaFormat::Y444 => {
-                                (mb_x * MB_SIDE_PX + bx * 8, my * MB_SIDE_PX + by * 8)
-                            }
-                        };
-                        blocks.push(encode_block(
-                            &frame.planes[plane_idx].data,
-                            frame.planes[plane_idx].stride,
-                            c_w,
-                            frame_h,
-                            x0,
-                            y0,
-                            &chroma_mul,
-                            bit_depth,
-                            field,
-                        ));
-                    }
-                }
-            }
-            let (y_data, cb_data, cr_data) =
-                encode_slice_components(mbs_this_slice, chroma, interlaced, &blocks)?;
-            if y_data.len() > u16::MAX as usize
-                || cb_data.len() > u16::MAX as usize
-                || cr_data.len() > u16::MAX as usize
-            {
-                return Err(Error::invalid(
-                    "prores encoder: slice component exceeded u16 size limit",
-                ));
-            }
-
-            let alpha_blob: Vec<u8> = if let Some(ac) = alpha {
-                // Emit alpha for the FULL macroblock-row height (16
-                // sample rows) even when the picture's last MB row is only
-                // partially visible. RDD 36 §5.3 sizes that row's array to
-                // the visible rows (`sliceVerticalSize`), which is what
-                // Apple's encoder writes; ffmpeg's prores_ks writes 16
-                // rows, and both Apple's and ffmpeg's decoders accept
-                // either form (black-box, r480), as does ours (the
-                // decoder's alpha branch). The 16-row form is kept so the
-                // encoder output pins stay stable. Edge pixels for the
-                // partially-visible last MB row clamp to the last visible
-                // row so the stream stays self-roundtrippable.
-                let slice_vertical_size = MB_SIDE_PX;
-                let cols = MB_SIDE_PX * mbs_this_slice;
-                let mut samples: Vec<u16> = Vec::with_capacity(cols * slice_vertical_size);
-                let a_plane = &frame.planes[3];
-                let a_stride = a_plane.stride;
-                for r in 0..slice_vertical_size {
-                    let frame_row = field
-                        .map(my * MB_SIDE_PX + r)
-                        .min(frame_h.saturating_sub(1));
-                    for c in 0..cols {
-                        let x = (mx * MB_SIDE_PX + c).min(frame_w.saturating_sub(1));
-                        // Read at the input plane's declared depth, then
-                        // map into the coded alpha domain (the
-                        // §7.5.2-mirror conversion; identity when the
-                        // input depth equals the coded width).
-                        let raw =
-                            read_alpha_input(&a_plane.data, a_stride, x, frame_row, ac.input_depth);
-                        samples.push(alpha_input_to_coded(raw, ac.input_depth, ac.act));
-                    }
-                }
-                encode_scanned_alpha(&samples, ac.act)?
-            } else {
-                Vec::new()
-            };
-
-            let cr_field = if alpha.is_some() {
-                Some(cr_data.len() as u16)
-            } else {
-                None
-            };
-            let mut slice_buf = Vec::with_capacity(
-                8 + y_data.len() + cb_data.len() + cr_data.len() + alpha_blob.len(),
-            );
-            write_slice_header(
-                &mut slice_buf,
-                quantization_index,
-                y_data.len() as u16,
-                cb_data.len() as u16,
-                cr_field,
-            );
-            slice_buf.extend_from_slice(&y_data);
-            slice_buf.extend_from_slice(&cb_data);
-            slice_buf.extend_from_slice(&cr_data);
-            slice_buf.extend_from_slice(&alpha_blob);
-            slice_payloads.push(slice_buf);
+            let start = payload.len();
+            coder.encode_slice(mx, my, mbs_this_slice, &mut scratch, &mut payload)?;
+            let size = u16::try_from(payload.len() - start).map_err(|_| {
+                Error::invalid("prores encoder: slice exceeded u16 size table limit")
+            })?;
+            slice_sizes.push(size);
             mx += mbs_this_slice;
         }
     }
-    debug_assert_eq!(slice_payloads.len(), slice_count);
-    if slice_payloads.iter().any(|p| p.len() > u16::MAX as usize) {
-        return Err(Error::invalid(
-            "prores encoder: slice exceeded u16 size table limit",
-        ));
-    }
+    debug_assert_eq!(slice_sizes.len(), slice_count);
 
     let slice_table_size = slice_count * 2;
-    let slice_bytes: usize = slice_payloads.iter().map(|p| p.len()).sum();
     let picture_header_size = 8usize;
-    let picture_size = (picture_header_size + slice_table_size + slice_bytes) as u32;
+    let picture_size = (picture_header_size + slice_table_size + payload.len()) as u32;
     let mut blob = Vec::with_capacity(picture_size as usize);
     write_picture_header(
         &mut blob,
@@ -1709,12 +1767,10 @@ fn encode_one_picture(
         },
         log2_slice_mb_width,
     );
-    for p in &slice_payloads {
-        blob.extend_from_slice(&(p.len() as u16).to_be_bytes());
+    for size in &slice_sizes {
+        blob.extend_from_slice(&size.to_be_bytes());
     }
-    for p in &slice_payloads {
-        blob.extend_from_slice(p);
-    }
+    blob.extend_from_slice(&payload);
     debug_assert_eq!(blob.len(), picture_size as usize);
     Ok(blob)
 }

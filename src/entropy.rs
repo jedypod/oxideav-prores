@@ -496,19 +496,32 @@ pub fn decode_scanned_coefficients(data: &[u8], num_blocks: usize) -> Result<Vec
 /// `coeffs` must be laid out in slice-scan order (DC block 0, DC block 1,
 /// ..., DC block N-1, AC freq 1 block 0, AC freq 1 block 1, ...).
 pub fn encode_scanned_coefficients(coeffs: &[i32], num_blocks: usize) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    encode_scanned_coefficients_into(coeffs, num_blocks, &mut out)?;
+    Ok(out)
+}
+
+/// [`encode_scanned_coefficients`], appending the coded bytes to `out`
+/// so a caller can reuse one buffer across slices.
+pub fn encode_scanned_coefficients_into(
+    coeffs: &[i32],
+    num_blocks: usize,
+    out: &mut Vec<u8>,
+) -> Result<()> {
     let total = num_blocks * 64;
     if coeffs.len() != total {
         return Err(Error::invalid(
             "prores entropy: coefficient buffer size mismatch",
         ));
     }
-    let mut bw = BitWriter::new();
+    let mut bw = BitWriter::from_vec(std::mem::take(out));
 
     // Symmetric with `decode_scanned_coefficients`: a zero-block slice
     // emits no DC/AC syntax. Return an empty payload before the first-DC
     // read below would index an empty `coeffs`.
     if num_blocks == 0 {
-        return Ok(bw.finish());
+        *out = bw.finish();
+        return Ok(());
     }
 
     // ---- DC ----
@@ -567,7 +580,8 @@ pub fn encode_scanned_coefficients(coeffs: &[i32], num_blocks: usize) -> Result<
 
     // Pad with zero bits to next byte boundary (spec's `zero_bit` loop).
     bw.align_byte();
-    Ok(bw.finish())
+    *out = bw.finish();
+    Ok(())
 }
 
 /// Write a `(value, length)` codeword from [`Vlc::codeword`]. Lengths
