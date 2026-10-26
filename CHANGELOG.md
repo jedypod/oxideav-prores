@@ -35,6 +35,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Coefficient encoder: the Table 9/10/11 codebooks are precomputed into
+  const lookup tables (built from `dc_diff_codebook`, `run_codebook` and
+  `level_codebook`, which are now `const fn`), and each run/level/sign
+  triple is written as one codeword where it fits 32 bits. The output is
+  unchanged.
 - `BitWriter` collects bits in a 64-bit accumulator and flushes four
   bytes at a time; Rice and exp-Golomb codewords are written with one
   `write_bits` call instead of one call per prefix bit. New
