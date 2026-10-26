@@ -1485,9 +1485,9 @@ fn encode_frame_full(
     };
 
     let interlaced = interlace_mode != 0;
-    let mut picture_blobs: Vec<Vec<u8>> = Vec::with_capacity(pictures.len());
+    let mut coded_pictures: Vec<CodedPicture> = Vec::with_capacity(pictures.len());
     for (picture_height, field) in &pictures {
-        let blob = encode_one_picture(
+        let picture = encode_one_picture(
             frame,
             width,
             height,
@@ -1503,13 +1503,13 @@ fn encode_frame_full(
             *field,
             threads,
         )?;
-        picture_blobs.push(blob);
+        coded_pictures.push(picture);
     }
 
     // Per §5.1.1 frame_header_size: 20 + 64 (load_luma) + 64 (load_chroma).
     let frame_header_size =
         20usize + if load_luma { 64 } else { 0 } + if load_chroma { 64 } else { 0 };
-    let pictures_total: usize = picture_blobs.iter().map(|p| p.len()).sum();
+    let pictures_total: usize = coded_pictures.iter().map(CodedPicture::len).sum();
     let total_frame_size_no_padding = 4 + 4 + frame_header_size + pictures_total;
     if total_frame_size_no_padding > cap {
         return Err(Error::invalid(
@@ -1532,8 +1532,8 @@ fn encode_frame_full(
         alpha.map_or(0, |a| a.act.code()),
         meta,
     );
-    for blob in &picture_blobs {
-        out.extend_from_slice(blob);
+    for picture in &coded_pictures {
+        picture.write(&mut out);
     }
     debug_assert_eq!(out.len(), total_frame_size_no_padding);
     Ok(out)
@@ -1719,13 +1719,18 @@ impl PictureCoder<'_> {
         Ok(())
     }
 
-    /// Code `slices` in order into one payload buffer, returning it with
-    /// each slice's size. With `threads > 1` the list is cut into runs
-    /// of consecutive slices that worker threads claim one at a time,
-    /// each coding into its own buffer with its own scratch; the runs
-    /// are then joined in order, so the payload does not depend on the
-    /// thread count or on scheduling.
-    fn encode_slices(&self, slices: &[(usize, usize, usize)], threads: usize) -> Result<CodedRun> {
+    /// Code `slices` in order, returning the coded runs of consecutive
+    /// slices in slice order; their bytes concatenated are the picture's
+    /// slice data. With `threads > 1` the list is cut into runs that
+    /// worker threads claim one at a time, each coding into its own
+    /// buffer with its own scratch, so the result does not depend on
+    /// the thread count or on scheduling. The runs are left separate
+    /// for the caller to copy once into the frame.
+    fn encode_slices(
+        &self,
+        slices: &[(usize, usize, usize)],
+        threads: usize,
+    ) -> Result<Vec<CodedRun>> {
         let run = |slices: &[(usize, usize, usize)], scratch: &mut SliceScratch| {
             let mut payload = Vec::new();
             let mut sizes = Vec::with_capacity(slices.len());
@@ -1750,7 +1755,7 @@ impl PictureCoder<'_> {
         let runs: Vec<_> = slices.chunks(run_len).collect();
         let threads = threads.min(runs.len());
         if threads <= 1 {
-            return run(slices, &mut SliceScratch::default());
+            return Ok(vec![run(slices, &mut SliceScratch::default())?]);
         }
 
         let next = std::sync::atomic::AtomicUsize::new(0);
@@ -1783,14 +1788,10 @@ impl PictureCoder<'_> {
             }
         });
 
-        let mut payload = Vec::new();
-        let mut sizes = Vec::with_capacity(slices.len());
-        for result in coded {
-            let (bytes, run_sizes) = result.expect("every run is claimed by a worker")?;
-            payload.extend_from_slice(&bytes);
-            sizes.extend_from_slice(&run_sizes);
-        }
-        Ok((payload, sizes))
+        coded
+            .into_iter()
+            .map(|result| result.expect("every run is claimed by a worker"))
+            .collect()
     }
 }
 
@@ -1803,10 +1804,9 @@ impl PictureCoder<'_> {
 /// must be the same matrices written into the frame header so the
 /// decoder dequantises with the matching W[][].
 ///
-/// Slices are coded straight into one payload buffer with one set of
-/// [`SliceScratch`] buffers per thread (see
-/// [`PictureCoder::encode_slices`]), then the header and slice table
-/// are prepended.
+/// Slices are coded with one set of [`SliceScratch`] buffers per
+/// thread (see [`PictureCoder::encode_slices`]); the caller writes the
+/// result into the frame with [`CodedPicture::write`].
 #[allow(clippy::too_many_arguments)]
 fn encode_one_picture(
     frame: &VideoFrame,
@@ -1823,7 +1823,7 @@ fn encode_one_picture(
     interlaced: bool,
     field: FieldStride,
     threads: usize,
-) -> Result<Vec<u8>> {
+) -> Result<CodedPicture> {
     let coder = PictureCoder {
         frame,
         frame_w,
@@ -1860,28 +1860,53 @@ fn encode_one_picture(
         }
     }
     debug_assert_eq!(slices.len(), slice_count);
-    let (payload, slice_sizes) = coder.encode_slices(&slices, threads)?;
-
-    let slice_table_size = slice_count * 2;
-    let picture_header_size = 8usize;
-    let picture_size = (picture_header_size + slice_table_size + payload.len()) as u32;
-    let mut blob = Vec::with_capacity(picture_size as usize);
-    write_picture_header(
-        &mut blob,
-        picture_size,
-        if slice_count <= u16::MAX as usize {
-            slice_count as u16
-        } else {
-            0
-        },
+    Ok(CodedPicture {
+        runs: coder.encode_slices(&slices, threads)?,
+        slice_count,
         log2_slice_mb_width,
-    );
-    for size in &slice_sizes {
-        blob.extend_from_slice(&size.to_be_bytes());
+    })
+}
+
+/// One coded `picture()`, kept as the runs of coded slices so that it
+/// is copied only once, into the frame.
+struct CodedPicture {
+    runs: Vec<CodedRun>,
+    slice_count: usize,
+    log2_slice_mb_width: u8,
+}
+
+impl CodedPicture {
+    /// Size of the `picture()` syntax: picture_header, slice table and
+    /// slice data.
+    fn len(&self) -> usize {
+        let picture_header_size = 8;
+        let data: usize = self.runs.iter().map(|(bytes, _)| bytes.len()).sum();
+        picture_header_size + self.slice_count * 2 + data
     }
-    blob.extend_from_slice(&payload);
-    debug_assert_eq!(blob.len(), picture_size as usize);
-    Ok(blob)
+
+    /// Append the `picture()` syntax to `out`.
+    fn write(&self, out: &mut Vec<u8>) {
+        let start = out.len();
+        write_picture_header(
+            out,
+            self.len() as u32,
+            if self.slice_count <= u16::MAX as usize {
+                self.slice_count as u16
+            } else {
+                0
+            },
+            self.log2_slice_mb_width,
+        );
+        for (_, sizes) in &self.runs {
+            for size in sizes {
+                out.extend_from_slice(&size.to_be_bytes());
+            }
+        }
+        for (bytes, _) in &self.runs {
+            out.extend_from_slice(bytes);
+        }
+        debug_assert_eq!(out.len() - start, self.len());
+    }
 }
 
 /// Read one 8x8 block of IDCT input values from a source plane,

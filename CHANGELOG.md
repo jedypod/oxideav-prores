@@ -39,6 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Encoder frames are assembled with a single copy of the coded slice
+  data: pictures are sized from their coded slice runs and written once
+  into an exactly sized frame buffer. The output is unchanged.
 - Encoder slices are coded straight into one per-picture payload buffer
   using one reusable set of scratch buffers, instead of allocating block,
   scan, component and slice vectors for every slice. New appending
