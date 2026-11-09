@@ -1438,52 +1438,13 @@ fn encode_frame_full(
     // Bound output capacity against header-declared dimensions.
     let cap = output_capacity_cap(img_w as u16, img_h as u16, chroma);
 
-    // Resolve the per-component matrices used for quantisation, and the
-    // minimal RDD 36 §6.1.1 carriage flags for them. When the caller passed
-    // flat (or no) matrices this yields load_*_qmat = 0 (byte-exact with the
-    // pre-config encoder); a custom luma sets load_luma; a chroma matrix that
-    // differs from the effective luma sets load_chroma. The four resulting
-    // (load_luma, load_chroma) combinations reconstruct exactly
-    // (qmat_pair.luma, qmat_pair.chroma) at the decoder — including the
-    // (0, 1) "default luma, custom chroma" form, which the previous
-    // derivation could not emit (it forced load_luma whenever *either*
-    // matrix was custom, wasting a redundant 64-byte flat luma table).
-    // Quantisation always uses the full pair; the flags only pick which
-    // tables land in the frame header. `explicit_qmat_carriage` forces
-    // the both-tables form the reference corpus streams always use
-    // (flags (1, 1), 148-byte header) — the decoder reconstructs the
-    // identical pair either way.
-    let qmat_pair = qmats.unwrap_or_default();
-    let (load_luma, load_chroma) = if explicit_qmat_carriage {
-        (true, true)
-    } else {
-        qmat_pair.wire_flags()
-    };
+    // Quantisation always uses the full matrix pair; the carriage flags
+    // only pick which tables land in the frame header.
+    let (qmat_pair, load_luma, load_chroma) = resolve_qmat_carriage(qmats, explicit_qmat_carriage);
     let luma_qmat = &qmat_pair.luma;
     let chroma_qmat = &qmat_pair.chroma;
 
-    // Per §6.2 picture_vertical_size derivation. Each interlaced field
-    // is a separate picture sized at half the frame height (rounded
-    // appropriately for top vs. bottom).
-    let pictures: Vec<(usize, FieldStride)> = if interlace_mode == 0 {
-        vec![(height, FieldStride::progressive())]
-    } else {
-        let top_h = height.div_ceil(2);
-        let bot_h = height / 2;
-        // interlace_mode 1: first picture is top field (offset 0)
-        // interlace_mode 2: first picture is bottom field (offset 1)
-        if interlace_mode == 1 {
-            vec![
-                (top_h, FieldStride::new(2, 0)),
-                (bot_h, FieldStride::new(2, 1)),
-            ]
-        } else {
-            vec![
-                (bot_h, FieldStride::new(2, 1)),
-                (top_h, FieldStride::new(2, 0)),
-            ]
-        }
-    };
+    let pictures = picture_layout(height, interlace_mode);
 
     let interlaced = interlace_mode != 0;
     let mut coded_pictures: Vec<CodedPicture> = Vec::with_capacity(pictures.len());
@@ -1507,9 +1468,112 @@ fn encode_frame_full(
         coded_pictures.push(picture);
     }
 
+    assemble_frame(
+        &coded_pictures,
+        FrameHeaderParams {
+            width: img_w as u16,
+            height: img_h as u16,
+            chroma,
+            interlace_mode,
+            qmats: qmat_pair,
+            load_luma,
+            load_chroma,
+            alpha_channel_type: alpha.map_or(0, |a| a.act.code()),
+            meta,
+        },
+        cap,
+    )
+}
+
+/// Resolve the matrices used for quantisation and the minimal RDD 36
+/// §6.1.1 carriage flags `(load_luma, load_chroma)` for them. Flat (or
+/// no) matrices give `(false, false)`; a custom luma sets `load_luma`;
+/// a chroma matrix that differs from the effective luma sets
+/// `load_chroma`. The four combinations reconstruct exactly the
+/// `(luma, chroma)` pair at the decoder, including the (0, 1) "default
+/// luma, custom chroma" form. `explicit_qmat_carriage` forces the
+/// both-tables form the reference corpus streams always use.
+fn resolve_qmat_carriage(
+    qmats: Option<QuantMatrices>,
+    explicit_qmat_carriage: bool,
+) -> (QuantMatrices, bool, bool) {
+    let pair = qmats.unwrap_or_default();
+    let (load_luma, load_chroma) = if explicit_qmat_carriage {
+        (true, true)
+    } else {
+        pair.wire_flags()
+    };
+    (pair, load_luma, load_chroma)
+}
+
+/// Per §6.2 picture_vertical_size derivation: the pictures of a frame
+/// as `(picture_height, field row mapping)`, in coding order. Each
+/// interlaced field is a separate picture sized at half the frame
+/// height (rounded up for the top field, down for the bottom).
+fn picture_layout(height: usize, interlace_mode: u8) -> Vec<(usize, FieldStride)> {
+    if interlace_mode == 0 {
+        return vec![(height, FieldStride::progressive())];
+    }
+    let top = (height.div_ceil(2), FieldStride::new(2, 0));
+    let bottom = (height / 2, FieldStride::new(2, 1));
+    // interlace_mode 1: first picture is the top field,
+    // interlace_mode 2: first picture is the bottom field.
+    if interlace_mode == 1 {
+        vec![top, bottom]
+    } else {
+        vec![bottom, top]
+    }
+}
+
+/// `(mx, my, mbs)` of every slice of a picture, in coding order:
+/// macroblock rows top to bottom, each cut into slices of the sizes
+/// [`compute_slice_sizes`] gives for the picture width.
+fn slice_layout(
+    frame_w: usize,
+    picture_height: usize,
+    log2_slice_mb_width: u8,
+) -> Vec<(usize, usize, usize)> {
+    let mbs_x = frame_w.div_ceil(MB_SIDE_PX);
+    let mbs_y = picture_height.div_ceil(MB_SIDE_PX);
+    let slice_sizes_template = compute_slice_sizes(mbs_x, log2_slice_mb_width);
+    let mut slices = Vec::with_capacity(slice_sizes_template.len() * mbs_y);
+    for my in 0..mbs_y {
+        let mut mx = 0usize;
+        for &mbs_this_slice in &slice_sizes_template {
+            let mbs_this_slice = mbs_this_slice.min(mbs_x - mx);
+            if mbs_this_slice == 0 {
+                break;
+            }
+            slices.push((mx, my, mbs_this_slice));
+            mx += mbs_this_slice;
+        }
+    }
+    slices
+}
+
+/// The frame-header fields of [`assemble_frame`].
+struct FrameHeaderParams {
+    width: u16,
+    height: u16,
+    chroma: ChromaFormat,
+    interlace_mode: u8,
+    qmats: QuantMatrices,
+    load_luma: bool,
+    load_chroma: bool,
+    alpha_channel_type: u8,
+    meta: FrameMeta,
+}
+
+/// Write the RDD 36 `frame()`: frame size, identifier, frame header and
+/// the coded pictures. `cap` bounds the frame size.
+fn assemble_frame(
+    coded_pictures: &[CodedPicture],
+    h: FrameHeaderParams,
+    cap: usize,
+) -> Result<Vec<u8>> {
     // Per §5.1.1 frame_header_size: 20 + 64 (load_luma) + 64 (load_chroma).
     let frame_header_size =
-        20usize + if load_luma { 64 } else { 0 } + if load_chroma { 64 } else { 0 };
+        20usize + if h.load_luma { 64 } else { 0 } + if h.load_chroma { 64 } else { 0 };
     let pictures_total: usize = coded_pictures.iter().map(CodedPicture::len).sum();
     let total_frame_size_no_padding = 4 + 4 + frame_header_size + pictures_total;
     if total_frame_size_no_padding > cap {
@@ -1522,18 +1586,18 @@ fn encode_frame_full(
     write_frame_with_meta(
         &mut out,
         total_frame_size_no_padding as u32,
-        img_w as u16,
-        img_h as u16,
-        chroma,
-        interlace_mode,
-        luma_qmat,
-        chroma_qmat,
-        load_luma,
-        load_chroma,
-        alpha.map_or(0, |a| a.act.code()),
-        meta,
+        h.width,
+        h.height,
+        h.chroma,
+        h.interlace_mode,
+        &h.qmats.luma,
+        &h.qmats.chroma,
+        h.load_luma,
+        h.load_chroma,
+        h.alpha_channel_type,
+        h.meta,
     );
-    for picture in &coded_pictures {
+    for picture in coded_pictures {
         picture.write(&mut out);
     }
     debug_assert_eq!(out.len(), total_frame_size_no_padding);
@@ -1708,13 +1772,8 @@ impl PictureCoder<'_> {
                 // map into the coded alpha domain (the
                 // §7.5.2-mirror conversion; identity when the
                 // input depth equals the coded width).
-                let raw = read_alpha_input(
-                    &a_plane.data,
-                    a_plane.stride,
-                    x,
-                    frame_row,
-                    ac.input_depth,
-                );
+                let raw =
+                    read_alpha_input(&a_plane.data, a_plane.stride, x, frame_row, ac.input_depth);
                 samples.push(alpha_input_to_coded(raw, ac.input_depth, ac.act));
             }
         }
@@ -1907,25 +1966,8 @@ fn encode_one_picture(
         interlaced,
         field,
     };
-    let mbs_x = frame_w.div_ceil(MB_SIDE_PX);
-    let mbs_y = picture_height.div_ceil(MB_SIDE_PX);
-    let slice_sizes_template = compute_slice_sizes(mbs_x, log2_slice_mb_width);
-    let slice_count = slice_sizes_template.len() * mbs_y;
-
-    // (mx, my, mbs) of every slice, in coding order.
-    let mut slices: Vec<(usize, usize, usize)> = Vec::with_capacity(slice_count);
-    for my in 0..mbs_y {
-        let mut mx = 0usize;
-        for &mbs_this_slice in &slice_sizes_template {
-            let mbs_this_slice = mbs_this_slice.min(mbs_x - mx);
-            if mbs_this_slice == 0 {
-                break;
-            }
-            slices.push((mx, my, mbs_this_slice));
-            mx += mbs_this_slice;
-        }
-    }
-    debug_assert_eq!(slices.len(), slice_count);
+    let slices = slice_layout(frame_w, picture_height, log2_slice_mb_width);
+    let slice_count = slices.len();
     Ok(CodedPicture {
         runs: coder.encode_slices(&slices, threads)?,
         slice_count,
