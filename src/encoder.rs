@@ -28,6 +28,8 @@ use crate::frame::{
 use crate::quant::{QuantMatrices, qscale};
 use crate::slice::encode_slice_components_into;
 
+pub mod quantized;
+
 /// Encoder-side configuration. Defaults match the legacy behaviour
 /// (flat all-4s quantisation matrices, `load_luma_qmat = 0`,
 /// `load_chroma_qmat = 0`, per-profile default quantisation index).
