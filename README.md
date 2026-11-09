@@ -200,6 +200,36 @@ Inputs are validated up front (ranges above, matrix weights `2..=63`,
 dimensions `1..=65535` per the u16 header fields — out-of-range is
 refused, never truncated).
 
+## Pre-quantised coefficients
+
+`encoder::quantized` splits the encoder at the quantiser, so colour
+conversion, the forward DCT and quantisation can run elsewhere (a GPU,
+another crate) while this crate does the entropy coding, slice
+assembly and headers. A `QuantizedFrame` carries, per slice, the
+macroblock position, a `quantization_index` and three `Vec<i16>`
+(Y, Cb, Cr) of 8x8 blocks in natural raster order, already divided by
+`W * qScale / 8` with round-half-away-from-zero. `encode_quantized_frame`
+turns it into a packet; `quantize_frame` is the CPU reference producer,
+and `encode_quantized_frame(quantize_frame(..))` is byte-identical to
+the normal encoder. `quantization_index` is chosen by the caller (the
+CPU encoder uses one fixed index per frame, or a frame-level binary
+search under rate control). Alpha is not supported. The module docs
+give the exact block order, rounding and slice layout.
+
+```rust,no_run
+use oxideav_prores::decoder::BitDepth;
+use oxideav_prores::encoder::EncoderConfig;
+use oxideav_prores::encoder::quantized::{encode_quantized_frame, quantize_frame};
+use oxideav_prores::frame::Profile;
+# fn run(frame: &oxideav_core::VideoFrame) -> oxideav_core::Result<()> {
+let config = EncoderConfig::signature_for_profile(Profile::Hq);
+let mut q = quantize_frame(frame, 1920, 1080, BitDepth::Ten, Profile::Hq, &config)?;
+// ... or build `q` from GPU output; edit coefficients freely ...
+q.pictures[0].slices[0].coefficients[0][1..64].fill(0);
+let packet = encode_quantized_frame(&config, &q)?;
+# let _ = packet; Ok(()) }
+```
+
 ## Conformance notes
 
 * Every §6.4 "decoder shall refuse" clause is enforced:
