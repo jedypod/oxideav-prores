@@ -1604,13 +1604,35 @@ impl PictureCoder<'_> {
         scratch: &mut SliceScratch,
         out: &mut Vec<u8>,
     ) -> Result<()> {
+        self.quantize_slice(mx, my, mbs, &mut scratch.blocks);
+        let alpha = self.alpha.map(|ac| {
+            move |samples: &mut Vec<u16>, out: &mut Vec<u8>| {
+                self.encode_alpha(ac, mx, my, mbs, samples, out)
+            }
+        });
+        code_slice_blocks(
+            self.chroma,
+            self.interlaced,
+            self.quantization_index,
+            mbs,
+            alpha,
+            scratch,
+            out,
+        )
+    }
+
+    /// Read, forward-DCT and quantise the `mbs` macroblocks starting at
+    /// macroblock `(mx, my)`, replacing the contents of `blocks` with
+    /// their coefficient blocks in slice order (per macroblock: four
+    /// luma blocks, then the Cb blocks, then the Cr blocks), each in
+    /// natural order.
+    fn quantize_slice(&self, mx: usize, my: usize, mbs: usize, blocks: &mut Vec<[i32; 64]>) {
         const LUMA_OFFSETS: [(usize, usize); 4] = [(0, 0), (1, 0), (0, 1), (1, 1)];
         let chroma_offsets: &[(usize, usize)] = match self.chroma {
             ChromaFormat::Y422 => &[(0, 0), (0, 1)],
             ChromaFormat::Y444 => &[(0, 0), (0, 1), (1, 0), (1, 1)],
         };
         let planes = &self.frame.planes;
-        let blocks = &mut scratch.blocks;
         blocks.clear();
         for mb_x in mx..mx + mbs {
             for (bx, by) in LUMA_OFFSETS {
@@ -1646,154 +1668,197 @@ impl PictureCoder<'_> {
                 }
             }
         }
+    }
 
-        // The header carries the payload sizes, so reserve its bytes and
-        // fill them in once the payloads are written.
-        let start = out.len();
-        let header_size = if self.alpha.is_some() { 8 } else { 6 };
-        out.resize(start + header_size, 0);
-        let [y_len, cb_len, cr_len] = encode_slice_components_into(
-            mbs,
-            self.chroma,
-            self.interlaced,
-            blocks,
-            &mut scratch.scan,
-            out,
-        )?;
-        if y_len > u16::MAX as usize || cb_len > u16::MAX as usize || cr_len > u16::MAX as usize {
-            return Err(Error::invalid(
-                "prores encoder: slice component exceeded u16 size limit",
-            ));
-        }
-
-        if let Some(ac) = self.alpha {
-            // Emit alpha for the FULL macroblock-row height (16
-            // sample rows) even when the picture's last MB row is only
-            // partially visible. RDD 36 §5.3 sizes that row's array to
-            // the visible rows (`sliceVerticalSize`), which is what
-            // Apple's encoder writes; ffmpeg's prores_ks writes 16
-            // rows, and both Apple's and ffmpeg's decoders accept
-            // either form (black-box, r480), as does ours (the
-            // decoder's alpha branch). The 16-row form is kept so the
-            // encoder output pins stay stable. Edge pixels for the
-            // partially-visible last MB row clamp to the last visible
-            // row so the stream stays self-roundtrippable.
-            let slice_vertical_size = MB_SIDE_PX;
-            let cols = MB_SIDE_PX * mbs;
-            let samples = &mut scratch.alpha;
-            samples.clear();
-            let a_plane = &planes[3];
-            for r in 0..slice_vertical_size {
-                let frame_row = self
-                    .field
-                    .map(my * MB_SIDE_PX + r)
-                    .min(self.frame_h.saturating_sub(1));
-                for c in 0..cols {
-                    let x = (mx * MB_SIDE_PX + c).min(self.frame_w.saturating_sub(1));
-                    // Read at the input plane's declared depth, then
-                    // map into the coded alpha domain (the
-                    // §7.5.2-mirror conversion; identity when the
-                    // input depth equals the coded width).
-                    let raw = read_alpha_input(
-                        &a_plane.data,
-                        a_plane.stride,
-                        x,
-                        frame_row,
-                        ac.input_depth,
-                    );
-                    samples.push(alpha_input_to_coded(raw, ac.input_depth, ac.act));
-                }
+    /// Gather the alpha samples of the slice at `(mx, my)` and append
+    /// their `scanned_alpha()` coding to `out`.
+    fn encode_alpha(
+        &self,
+        ac: AlphaCoding,
+        mx: usize,
+        my: usize,
+        mbs: usize,
+        samples: &mut Vec<u16>,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        let planes = &self.frame.planes;
+        // Emit alpha for the FULL macroblock-row height (16
+        // sample rows) even when the picture's last MB row is only
+        // partially visible. RDD 36 §5.3 sizes that row's array to
+        // the visible rows (`sliceVerticalSize`), which is what
+        // Apple's encoder writes; ffmpeg's prores_ks writes 16
+        // rows, and both Apple's and ffmpeg's decoders accept
+        // either form (black-box, r480), as does ours (the
+        // decoder's alpha branch). The 16-row form is kept so the
+        // encoder output pins stay stable. Edge pixels for the
+        // partially-visible last MB row clamp to the last visible
+        // row so the stream stays self-roundtrippable.
+        let slice_vertical_size = MB_SIDE_PX;
+        let cols = MB_SIDE_PX * mbs;
+        samples.clear();
+        let a_plane = &planes[3];
+        for r in 0..slice_vertical_size {
+            let frame_row = self
+                .field
+                .map(my * MB_SIDE_PX + r)
+                .min(self.frame_h.saturating_sub(1));
+            for c in 0..cols {
+                let x = (mx * MB_SIDE_PX + c).min(self.frame_w.saturating_sub(1));
+                // Read at the input plane's declared depth, then
+                // map into the coded alpha domain (the
+                // §7.5.2-mirror conversion; identity when the
+                // input depth equals the coded width).
+                let raw = read_alpha_input(
+                    &a_plane.data,
+                    a_plane.stride,
+                    x,
+                    frame_row,
+                    ac.input_depth,
+                );
+                samples.push(alpha_input_to_coded(raw, ac.input_depth, ac.act));
             }
-            encode_scanned_alpha_into(samples, ac.act, out)?;
         }
-
-        scratch.header.clear();
-        write_slice_header(
-            &mut scratch.header,
-            self.quantization_index,
-            y_len as u16,
-            cb_len as u16,
-            self.alpha.map(|_| cr_len as u16),
-        );
-        debug_assert_eq!(scratch.header.len(), header_size);
-        out[start..start + header_size].copy_from_slice(&scratch.header);
-        Ok(())
+        encode_scanned_alpha_into(samples, ac.act, out)
     }
 
     /// Code `slices` in order, returning the coded runs of consecutive
-    /// slices in slice order; their bytes concatenated are the picture's
-    /// slice data. With `threads > 1` the list is cut into runs that
-    /// worker threads claim one at a time, each coding into its own
-    /// buffer with its own scratch, so the result does not depend on
-    /// the thread count or on scheduling. The runs are left separate
-    /// for the caller to copy once into the frame.
+    /// slices in slice order; see [`code_slices`].
     fn encode_slices(
         &self,
         slices: &[(usize, usize, usize)],
         threads: usize,
     ) -> Result<Vec<CodedRun>> {
-        let run = |slices: &[(usize, usize, usize)], scratch: &mut SliceScratch| {
-            let mut payload = Vec::new();
-            let mut sizes = Vec::with_capacity(slices.len());
-            for &(mx, my, mbs) in slices {
-                let start = payload.len();
-                self.encode_slice(mx, my, mbs, scratch, &mut payload)?;
-                let size = u16::try_from(payload.len() - start).map_err(|_| {
-                    Error::invalid("prores encoder: slice exceeded u16 size table limit")
-                })?;
-                sizes.push(size);
-            }
-            Ok::<_, Error>((payload, sizes))
-        };
-        // Several runs per thread even out slices of uneven cost, and a
-        // run of at least a few slices keeps the per-run overhead small.
-        const RUNS_PER_THREAD: usize = 4;
-        const MIN_RUN: usize = 8;
-        let run_len = slices
-            .len()
-            .div_ceil(threads.saturating_mul(RUNS_PER_THREAD))
-            .max(MIN_RUN);
-        let runs: Vec<_> = slices.chunks(run_len).collect();
-        let threads = threads.min(runs.len());
-        if threads <= 1 {
-            return Ok(vec![run(slices, &mut SliceScratch::default())?]);
-        }
-
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let mut coded: Vec<Option<Result<CodedRun>>> = Vec::new();
-        coded.resize_with(runs.len(), || None);
-        std::thread::scope(|scope| {
-            let workers: Vec<_> = (0..threads)
-                .map(|_| {
-                    scope.spawn(|| {
-                        let mut scratch = SliceScratch::default();
-                        let mut done = Vec::new();
-                        loop {
-                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let Some(slices) = runs.get(i) else {
-                                break;
-                            };
-                            done.push((i, run(slices, &mut scratch)));
-                        }
-                        done
-                    })
-                })
-                .collect();
-            for worker in workers {
-                let done = worker
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-                for (i, result) in done {
-                    coded[i] = Some(result);
-                }
-            }
-        });
-
-        coded
-            .into_iter()
-            .map(|result| result.expect("every run is claimed by a worker"))
-            .collect()
+        code_slices(slices, threads, |&(mx, my, mbs), scratch, out| {
+            self.encode_slice(mx, my, mbs, scratch, out)
+        })
     }
+}
+
+/// Entropy-code one slice whose quantised coefficient blocks are in
+/// `scratch.blocks` (slice order, natural order within a block) and
+/// append the complete `slice()` (header, Y, Cb, Cr and, when `alpha`
+/// is given, the alpha data it appends) to `out`.
+///
+/// `alpha` receives the alpha sample scratch buffer and `out`, and
+/// appends the `scanned_alpha()` coding to `out`.
+fn code_slice_blocks(
+    chroma: ChromaFormat,
+    interlaced: bool,
+    quantization_index: u8,
+    mbs: usize,
+    alpha: Option<impl FnOnce(&mut Vec<u16>, &mut Vec<u8>) -> Result<()>>,
+    scratch: &mut SliceScratch,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    // The header carries the payload sizes, so reserve its bytes and
+    // fill them in once the payloads are written.
+    let start = out.len();
+    let has_alpha = alpha.is_some();
+    let header_size = if has_alpha { 8 } else { 6 };
+    out.resize(start + header_size, 0);
+    let [y_len, cb_len, cr_len] = encode_slice_components_into(
+        mbs,
+        chroma,
+        interlaced,
+        &scratch.blocks,
+        &mut scratch.scan,
+        out,
+    )?;
+    if y_len > u16::MAX as usize || cb_len > u16::MAX as usize || cr_len > u16::MAX as usize {
+        return Err(Error::invalid(
+            "prores encoder: slice component exceeded u16 size limit",
+        ));
+    }
+    if let Some(alpha) = alpha {
+        alpha(&mut scratch.alpha, out)?;
+    }
+    scratch.header.clear();
+    write_slice_header(
+        &mut scratch.header,
+        quantization_index,
+        y_len as u16,
+        cb_len as u16,
+        has_alpha.then_some(cr_len as u16),
+    );
+    debug_assert_eq!(scratch.header.len(), header_size);
+    out[start..start + header_size].copy_from_slice(&scratch.header);
+    Ok(())
+}
+
+/// Code `slices` in order with `code`, which appends one complete
+/// `slice()` to its output buffer. Returns the coded runs of
+/// consecutive slices in slice order; their bytes concatenated are the
+/// picture's slice data. With `threads > 1` the list is cut into runs
+/// that worker threads claim one at a time, each coding into its own
+/// buffer with its own scratch, so the result does not depend on the
+/// thread count or on scheduling. The runs are left separate for the
+/// caller to copy once into the frame.
+fn code_slices<S: Sync>(
+    slices: &[S],
+    threads: usize,
+    code: impl Fn(&S, &mut SliceScratch, &mut Vec<u8>) -> Result<()> + Sync,
+) -> Result<Vec<CodedRun>> {
+    let run = |slices: &[S], scratch: &mut SliceScratch| {
+        let mut payload = Vec::new();
+        let mut sizes = Vec::with_capacity(slices.len());
+        for slice in slices {
+            let start = payload.len();
+            code(slice, scratch, &mut payload)?;
+            let size = u16::try_from(payload.len() - start).map_err(|_| {
+                Error::invalid("prores encoder: slice exceeded u16 size table limit")
+            })?;
+            sizes.push(size);
+        }
+        Ok::<_, Error>((payload, sizes))
+    };
+    // Several runs per thread even out slices of uneven cost, and a
+    // run of at least a few slices keeps the per-run overhead small.
+    const RUNS_PER_THREAD: usize = 4;
+    const MIN_RUN: usize = 8;
+    let run_len = slices
+        .len()
+        .div_ceil(threads.saturating_mul(RUNS_PER_THREAD))
+        .max(MIN_RUN);
+    let runs: Vec<_> = slices.chunks(run_len).collect();
+    let threads = threads.min(runs.len());
+    if threads <= 1 {
+        return Ok(vec![run(slices, &mut SliceScratch::default())?]);
+    }
+
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut coded: Vec<Option<Result<CodedRun>>> = Vec::new();
+    coded.resize_with(runs.len(), || None);
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut scratch = SliceScratch::default();
+                    let mut done = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(slices) = runs.get(i) else {
+                            break;
+                        };
+                        done.push((i, run(slices, &mut scratch)));
+                    }
+                    done
+                })
+            })
+            .collect();
+        for worker in workers {
+            let done = worker
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            for (i, result) in done {
+                coded[i] = Some(result);
+            }
+        }
+    });
+
+    coded
+        .into_iter()
+        .map(|result| result.expect("every run is claimed by a worker"))
+        .collect()
 }
 
 /// Build one `picture()` blob (picture_header + slice_table +
